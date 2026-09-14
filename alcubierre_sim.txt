@@ -1,0 +1,810 @@
+/*UNSC.mil #ComingSoon
+ * alcubierre_sim.c
+ *
+ * Speculative Alcubierre-drive numerical simulator.
+ * This program DOES NOT operate a physical warp drive.
+ *
+ * It models a simplified Alcubierre-style warp bubble using:
+ *
+ *   ds^2 = -c^2 dt^2 + [dx - v_s f(r_s) dt]^2 + dy^2 + dz^2
+ *
+ * with the commonly used smooth shape function
+ *
+ *   f(r) =
+ *     [tanh(sigma(r + R)) - tanh(sigma(r - R))]
+ *     ------------------------------------------------
+ *                 2 tanh(sigma R)
+ *
+ * The code provides:
+ *   - warp-bubble shape evaluation
+ *   - moving bubble center
+ *   - approximate metric components
+ *   - numerical shape gradients
+ *   - toy energy-density estimator
+ *   - trajectory integration
+ *   - throttle/ramp controls
+ *   - CSV telemetry output
+ *
+ * Compile:
+ *   gcc -O2 -std=c11 alcubierre_sim.c -lm -o alcubierre_sim
+ *
+ * Run:
+ *   ./alcubierre_sim
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <stdbool.h>
+
+#define C       299792458.0
+#define G       6.67430e-11
+#define PI      3.14159265358979323846
+
+typedef struct {
+    double x;
+    double y;
+    double z;
+} Vec3;
+
+typedef struct {
+    double radius;        /* Bubble radius, meters */
+    double sigma;         /* Wall steepness, 1/m */
+    double warp_factor;   /* Requested coordinate speed / c */
+    double throttle;      /* 0.0 - 1.0 */
+    Vec3 center;          /* Bubble center */
+    Vec3 direction;       /* Unit travel direction */
+} WarpBubble;
+
+typedef struct {
+    double t;
+    Vec3 position;
+    Vec3 velocity;
+} Spacecraft;
+
+typedef struct {
+    double g00;
+    double g01;
+    double g02;
+    double g03;
+
+    double g11;
+    double g12;
+    double g13;
+
+    double g22;
+    double g23;
+
+    double g33;
+} MetricTensor;
+
+/* --------------------------------------------------------- */
+/* Vector math                                               */
+/* --------------------------------------------------------- */
+
+static Vec3 vec3(double x, double y, double z)
+{
+    Vec3 v = {x, y, z};
+    return v;
+}
+
+static Vec3 add(Vec3 a, Vec3 b)
+{
+    return vec3(
+        a.x + b.x,
+        a.y + b.y,
+        a.z + b.z
+    );
+}
+
+static Vec3 sub(Vec3 a, Vec3 b)
+{
+    return vec3(
+        a.x - b.x,
+        a.y - b.y,
+        a.z - b.z
+    );
+}
+
+static Vec3 scale(Vec3 a, double s)
+{
+    return vec3(
+        a.x * s,
+        a.y * s,
+        a.z * s
+    );
+}
+
+static double magnitude(Vec3 a)
+{
+    return sqrt(
+        a.x * a.x +
+        a.y * a.y +
+        a.z * a.z
+    );
+}
+
+static Vec3 normalize(Vec3 a)
+{
+    double m = magnitude(a);
+
+    if (m == 0.0)
+        return vec3(1.0, 0.0, 0.0);
+
+    return scale(a, 1.0 / m);
+}
+
+/* --------------------------------------------------------- */
+/* Warp bubble                                               */
+/* --------------------------------------------------------- */
+
+static double bubble_speed(const WarpBubble *w)
+{
+    return C * w->warp_factor * w->throttle;
+}
+
+/*
+ * Alcubierre-style smooth top-hat shape function.
+ */
+static double shape_function(double r,
+                             double R,
+                             double sigma)
+{
+    double denominator = 2.0 * tanh(sigma * R);
+
+    if (fabs(denominator) < 1e-15)
+        return 0.0;
+
+    return (
+        tanh(sigma * (r + R)) -
+        tanh(sigma * (r - R))
+    ) / denominator;
+}
+
+static double bubble_shape(const WarpBubble *w, Vec3 p)
+{
+    Vec3 relative = sub(p, w->center);
+    double r = magnitude(relative);
+
+    return shape_function(
+        r,
+        w->radius,
+        w->sigma
+    );
+}
+
+/* --------------------------------------------------------- */
+/* Numerical gradient                                        */
+/* --------------------------------------------------------- */
+
+static Vec3 bubble_gradient(const WarpBubble *w, Vec3 p)
+{
+    double h = fmax(w->radius * 1e-5, 1e-6);
+
+    Vec3 xp = p;
+    Vec3 xm = p;
+
+    xp.x += h;
+    xm.x -= h;
+
+    double dfdx =
+        (bubble_shape(w, xp) -
+         bubble_shape(w, xm))
+        / (2.0 * h);
+
+    xp = p;
+    xm = p;
+
+    xp.y += h;
+    xm.y -= h;
+
+    double dfdy =
+        (bubble_shape(w, xp) -
+         bubble_shape(w, xm))
+        / (2.0 * h);
+
+    xp = p;
+    xm = p;
+
+    xp.z += h;
+    xm.z -= h;
+
+    double dfdz =
+        (bubble_shape(w, xp) -
+         bubble_shape(w, xm))
+        / (2.0 * h);
+
+    return vec3(dfdx, dfdy, dfdz);
+}
+
+/* --------------------------------------------------------- */
+/* Simplified Alcubierre metric                              */
+/* --------------------------------------------------------- */
+
+static MetricTensor metric_at(const WarpBubble *w, Vec3 p)
+{
+    MetricTensor g = {0};
+
+    double f = bubble_shape(w, p);
+    double v = bubble_speed(w);
+
+    Vec3 n = normalize(w->direction);
+
+    /*
+     * Shift vector:
+     *
+     * beta_i = -v f n_i
+     */
+
+    double bx = -v * f * n.x;
+    double by = -v * f * n.y;
+    double bz = -v * f * n.z;
+
+    /*
+     * Metric corresponding approximately to:
+     *
+     * ds² = -c²dt² +
+     *       |dX - v f n dt|²
+     */
+
+    g.g00 =
+        -C * C +
+        bx * bx +
+        by * by +
+        bz * bz;
+
+    g.g01 = bx;
+    g.g02 = by;
+    g.g03 = bz;
+
+    g.g11 = 1.0;
+    g.g22 = 1.0;
+    g.g33 = 1.0;
+
+    g.g12 = 0.0;
+    g.g13 = 0.0;
+    g.g23 = 0.0;
+
+    return g;
+}
+
+/* --------------------------------------------------------- */
+/* Toy negative-energy estimator                             */
+/* --------------------------------------------------------- */
+
+/*
+ * This is NOT a complete Einstein-tensor calculation.
+ *
+ * It approximates the characteristic scaling:
+ *
+ *     rho ~ -(c^4 / 32 pi G)
+ *            (v/c)^2 |grad f|^2
+ *
+ * It is useful only for exploring the qualitative behavior
+ * of the mathematical model.
+ */
+
+static double approximate_energy_density(
+    const WarpBubble *w,
+    Vec3 p
+)
+{
+    Vec3 grad = bubble_gradient(w, p);
+
+    double grad2 =
+        grad.x * grad.x +
+        grad.y * grad.y +
+        grad.z * grad.z;
+
+    double beta = bubble_speed(w) / C;
+
+    return
+        -(pow(C, 4.0) /
+          (32.0 * PI * G))
+        *
+        beta * beta
+        *
+        grad2;
+}
+
+/* --------------------------------------------------------- */
+/* Bubble motion                                             */
+/* --------------------------------------------------------- */
+
+static void update_bubble(
+    WarpBubble *w,
+    double dt
+)
+{
+    double speed = bubble_speed(w);
+
+    Vec3 displacement =
+        scale(
+            normalize(w->direction),
+            speed * dt
+        );
+
+    w->center =
+        add(w->center, displacement);
+}
+
+/* --------------------------------------------------------- */
+/* Smooth throttle                                           */
+/* --------------------------------------------------------- */
+
+static double smoothstep(double x)
+{
+    if (x <= 0.0)
+        return 0.0;
+
+    if (x >= 1.0)
+        return 1.0;
+
+    return x * x * (3.0 - 2.0 * x);
+}
+
+static double warp_profile(
+    double time,
+    double ramp_up,
+    double cruise_end,
+    double ramp_down_end
+)
+{
+    if (time < 0.0)
+        return 0.0;
+
+    if (time < ramp_up)
+        return smoothstep(time / ramp_up);
+
+    if (time < cruise_end)
+        return 1.0;
+
+    if (time < ramp_down_end) {
+
+        double x =
+            (time - cruise_end) /
+            (ramp_down_end - cruise_end);
+
+        return 1.0 - smoothstep(x);
+    }
+
+    return 0.0;
+}
+
+/* --------------------------------------------------------- */
+/* Spacecraft                                                */
+/* --------------------------------------------------------- */
+
+static void update_spacecraft(
+    Spacecraft *craft,
+    const WarpBubble *bubble,
+    double dt
+)
+{
+    /*
+     * Toy assumption:
+     *
+     * A spacecraft positioned at the bubble center is
+     * transported with the moving coordinate bubble.
+     *
+     * This is NOT ordinary local FTL motion.
+     */
+
+    craft->velocity =
+        scale(
+            normalize(bubble->direction),
+            bubble_speed(bubble)
+        );
+
+    craft->position =
+        bubble->center;
+
+    craft->t += dt;
+}
+
+/* --------------------------------------------------------- */
+/* Bubble-wall energy sampling                               */
+/* --------------------------------------------------------- */
+
+static double estimate_total_energy(
+    const WarpBubble *bubble,
+    int radial_samples,
+    int angular_samples
+)
+{
+    double Rmax =
+        bubble->radius +
+        6.0 / bubble->sigma;
+
+    double dr =
+        Rmax / radial_samples;
+
+    double total = 0.0;
+
+    for (int i = 0;
+         i < radial_samples;
+         ++i) {
+
+        double r =
+            (i + 0.5) * dr;
+
+        for (int j = 0;
+             j < angular_samples;
+             ++j) {
+
+            double theta =
+                PI *
+                (j + 0.5) /
+                angular_samples;
+
+            double sin_theta =
+                sin(theta);
+
+            Vec3 p = {
+
+                bubble->center.x +
+                    r * sin_theta,
+
+                bubble->center.y,
+
+                bubble->center.z +
+                    r * cos(theta)
+            };
+
+            double rho =
+                approximate_energy_density(
+                    bubble,
+                    p
+                );
+
+            /*
+             * Axisymmetric volume element
+             *
+             * dV =
+             * 2 pi r² sin(theta)
+             * dr dtheta
+             */
+
+            double dtheta =
+                PI /
+                angular_samples;
+
+            double dV =
+                2.0 *
+                PI *
+                r * r *
+                sin_theta *
+                dr *
+                dtheta;
+
+            total += rho * dV;
+        }
+    }
+
+    return total;
+}
+
+/* --------------------------------------------------------- */
+/* Diagnostics                                               */
+/* --------------------------------------------------------- */
+
+static void print_metric(MetricTensor g)
+{
+    printf("\nMetric tensor:\n");
+
+    printf(
+        "[ % .6e % .6e % .6e % .6e ]\n",
+        g.g00,
+        g.g01,
+        g.g02,
+        g.g03
+    );
+
+    printf(
+        "[ % .6e % .6e % .6e % .6e ]\n",
+        g.g01,
+        g.g11,
+        g.g12,
+        g.g13
+    );
+
+    printf(
+        "[ % .6e % .6e % .6e % .6e ]\n",
+        g.g02,
+        g.g12,
+        g.g22,
+        g.g23
+    );
+
+    printf(
+        "[ % .6e % .6e % .6e % .6e ]\n",
+        g.g03,
+        g.g13,
+        g.g23,
+        g.g33
+    );
+}
+
+/* --------------------------------------------------------- */
+/* Main simulation                                           */
+/* --------------------------------------------------------- */
+
+int main(void)
+{
+    WarpBubble bubble = {
+
+        .radius = 100.0,
+
+        /*
+         * Larger sigma produces a thinner,
+         * sharper bubble wall.
+         */
+        .sigma = 0.10,
+
+        /*
+         * Coordinate velocity = warp_factor * c.
+         *
+         * Values >1 are permitted here because this
+         * is a mathematical spacetime model rather
+         * than ordinary local motion.
+         */
+        .warp_factor = 2.0,
+
+        .throttle = 0.0,
+
+        .center = {
+            0.0,
+            0.0,
+            0.0
+        },
+
+        .direction = {
+            1.0,
+            0.0,
+            0.0
+        }
+    };
+
+    Spacecraft craft = {
+
+        .t = 0.0,
+
+        .position = {
+            0.0,
+            0.0,
+            0.0
+        },
+
+        .velocity = {
+            0.0,
+            0.0,
+            0.0
+        }
+    };
+
+    /*
+     * Simulation timing.
+     */
+
+    double dt = 0.001;
+
+    double ramp_up = 0.25;
+    double cruise_end = 1.25;
+    double ramp_down_end = 1.50;
+
+    double simulation_end = 1.60;
+
+    FILE *telemetry =
+        fopen(
+            "warp_telemetry.csv",
+            "w"
+        );
+
+    if (!telemetry) {
+        perror("warp_telemetry.csv");
+        return EXIT_FAILURE;
+    }
+
+    fprintf(
+        telemetry,
+        "time,"
+        "throttle,"
+        "warp_factor,"
+        "velocity_m_s,"
+        "velocity_c,"
+        "x,"
+        "y,"
+        "z,"
+        "shape_center,"
+        "wall_energy_density\n"
+    );
+
+    printf(
+        "ALCUBIERRE METRIC SIMULATOR\n"
+        "---------------------------\n"
+    );
+
+    printf(
+        "Bubble radius      : %.3f m\n",
+        bubble.radius
+    );
+
+    printf(
+        "Bubble sigma       : %.6f 1/m\n",
+        bubble.sigma
+    );
+
+    printf(
+        "Maximum warp factor: %.3f c\n",
+        bubble.warp_factor
+    );
+
+    printf(
+        "Simulation dt      : %.6f s\n\n",
+        dt
+    );
+
+    unsigned long step = 0;
+
+    while (craft.t <= simulation_end) {
+
+        bubble.throttle =
+            warp_profile(
+                craft.t,
+                ramp_up,
+                cruise_end,
+                ramp_down_end
+            );
+
+        update_bubble(
+            &bubble,
+            dt
+        );
+
+        update_spacecraft(
+            &craft,
+            &bubble,
+            dt
+        );
+
+        Vec3 wall_point = {
+
+            bubble.center.x +
+                bubble.radius,
+
+            bubble.center.y,
+
+            bubble.center.z
+        };
+
+        double wall_energy =
+            approximate_energy_density(
+                &bubble,
+                wall_point
+            );
+
+        double speed =
+            bubble_speed(
+                &bubble
+            );
+
+        fprintf(
+            telemetry,
+            "%.9f,"
+            "%.9f,"
+            "%.9f,"
+            "%.12e,"
+            "%.9f,"
+            "%.12e,"
+            "%.12e,"
+            "%.12e,"
+            "%.9f,"
+            "%.12e\n",
+
+            craft.t,
+            bubble.throttle,
+            bubble.warp_factor,
+            speed,
+            speed / C,
+
+            craft.position.x,
+            craft.position.y,
+            craft.position.z,
+
+            bubble_shape(
+                &bubble,
+                bubble.center
+            ),
+
+            wall_energy
+        );
+
+        if (step % 100 == 0) {
+
+            printf(
+                "t=%6.3f s | "
+                "throttle=%5.2f | "
+                "v=%6.3f c | "
+                "x=% .6e m\n",
+
+                craft.t,
+                bubble.throttle,
+                speed / C,
+                craft.position.x
+            );
+        }
+
+        step++;
+    }
+
+    fclose(telemetry);
+
+    printf(
+        "\nFinal simulated coordinate:\n"
+    );
+
+    printf(
+        "X = %.12e m\n",
+        craft.position.x
+    );
+
+    printf(
+        "Y = %.12e m\n",
+        craft.position.y
+    );
+
+    printf(
+        "Z = %.12e m\n",
+        craft.position.z
+    );
+
+    /*
+     * Metric at bubble center.
+     */
+
+    MetricTensor center_metric =
+        metric_at(
+            &bubble,
+            bubble.center
+        );
+
+    print_metric(
+        center_metric
+    );
+
+    /*
+     * Estimate exotic-energy requirement at maximum
+     * requested warp factor.
+     */
+
+    bubble.throttle = 1.0;
+
+    double total_energy =
+        estimate_total_energy(
+            &bubble,
+            500,
+            300
+        );
+
+    printf(
+        "\nToy integrated negative energy estimate:\n"
+    );
+
+    printf(
+        "E ~= %.12e J\n",
+        total_energy
+    );
+
+    printf(
+        "Equivalent mass E/c^2 ~= %.12e kg\n",
+        total_energy /
+        (C * C)
+    );
+
+    printf(
+        "\nTelemetry written to "
+        "warp_telemetry.csv\n"
+    );
+
+    return EXIT_SUCCESS;
+}
