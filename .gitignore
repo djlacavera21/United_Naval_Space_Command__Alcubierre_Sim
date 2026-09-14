@@ -1,0 +1,6 @@
+/build/
+__pycache__/
+*.pyc
+/warp_telemetry.csv
+/warp_summary.json
+/warp_slice.csv
